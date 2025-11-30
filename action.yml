@@ -1,6 +1,6 @@
 name: Test Reporter
 description: |
-  Shows test results in GitHub UI: .NET (xUnit, NUnit, MSTest), Dart, Flutter, Java (JUnit), JavaScript (JEST, Mocha)
+  Shows test results in GitHub UI: .NET (xUnit, NUnit, MSTest), Dart, Flutter, Go, Java (JUnit), JavaScript (JEST, Mocha), Python (pytest, unittest), Ruby (RSpec), Swift
 author: Michal Dorner <dorner.michal@gmail.com>
 inputs:
   artifact:
@@ -29,9 +29,11 @@ inputs:
         - dotnet-nunit
         - dotnet-trx
         - flutter-json
+        - golang-json
         - java-junit
         - jest-junit
         - mocha-json
+        - python-xunit
         - rspec-json
         - swift-xunit
     required: true
@@ -89,6 +91,14 @@ inputs:
     description: Customize badge title
     required: false
     default: 'tests'
+  collapsed:
+    description: |
+      Controls whether test report details are collapsed or expanded. Supported options:
+        - auto: Collapse only if all tests pass (default behavior)
+        - always: Always collapse the report details
+        - never: Always expand the report details
+    required: false
+    default: 'auto'
   token:
     description: GitHub Access Token
     required: false
