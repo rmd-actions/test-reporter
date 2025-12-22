@@ -17,9 +17,9 @@ import {GolangJsonParser} from './parsers/golang-json/golang-json-parser'
 import {JavaJunitParser} from './parsers/java-junit/java-junit-parser'
 import {JestJunitParser} from './parsers/jest-junit/jest-junit-parser'
 import {MochaJsonParser} from './parsers/mocha-json/mocha-json-parser'
+import {PythonXunitParser} from './parsers/python-xunit/python-xunit-parser'
 import {RspecJsonParser} from './parsers/rspec-json/rspec-json-parser'
 import {SwiftXunitParser} from './parsers/swift-xunit/swift-xunit-parser'
-
 import {normalizeDirPath, normalizeFilePath} from './utils/path-utils'
 import {getCheckRunContext} from './utils/github-utils'
 
@@ -49,6 +49,7 @@ class TestReporter {
   readonly useActionsSummary = core.getInput('use-actions-summary', {required: false}) === 'true'
   readonly badgeTitle = core.getInput('badge-title', {required: false})
   readonly reportTitle = core.getInput('report-title', {required: false})
+  readonly collapsed = core.getInput('collapsed', {required: false}) as 'auto' | 'always' | 'never'
   readonly token = core.getInput('token', {required: true})
   readonly octokit: InstanceType<typeof GitHub>
   readonly context = getCheckRunContext()
@@ -63,6 +64,11 @@ class TestReporter {
 
     if (this.listTests !== 'all' && this.listTests !== 'failed' && this.listTests !== 'none') {
       core.setFailed(`Input parameter 'list-tests' has invalid value`)
+      return
+    }
+
+    if (this.collapsed !== 'auto' && this.collapsed !== 'always' && this.collapsed !== 'never') {
+      core.setFailed(`Input parameter 'collapsed' has invalid value`)
       return
     }
 
@@ -166,7 +172,7 @@ class TestReporter {
       }
     }
 
-    const {listSuites, listTests, onlySummary, useActionsSummary, badgeTitle, reportTitle} = this
+    const {listSuites, listTests, onlySummary, useActionsSummary, badgeTitle, reportTitle, collapsed} = this
 
     const passed = results.reduce((sum, tr) => sum + tr.passed, 0)
     const failed = results.reduce((sum, tr) => sum + tr.failed, 0)
@@ -175,19 +181,23 @@ class TestReporter {
 
     let baseUrl = ''
     if (this.useActionsSummary) {
-      const summary = getReport(results, {
-        listSuites,
-        listTests,
-        baseUrl,
-        onlySummary,
-        useActionsSummary,
-        badgeTitle,
-        reportTitle
-      })
+      const summary = getReport(
+        results,
+        {
+          listSuites,
+          listTests,
+          baseUrl,
+          onlySummary,
+          useActionsSummary,
+          badgeTitle,
+          reportTitle,
+          collapsed
+        },
+        shortSummary
+      )
 
       core.info('Summary content:')
       core.info(summary)
-      core.summary.addRaw(`# ${shortSummary}`)
       await core.summary.addRaw(summary).write()
     } else {
       core.info(`Creating check run ${name}`)
@@ -211,7 +221,8 @@ class TestReporter {
         onlySummary,
         useActionsSummary,
         badgeTitle,
-        reportTitle
+        reportTitle,
+        collapsed
       })
 
       core.info('Creating annotations')
@@ -260,6 +271,8 @@ class TestReporter {
         return new JestJunitParser(options)
       case 'mocha-json':
         return new MochaJsonParser(options)
+      case 'python-xunit':
+        return new PythonXunitParser(options)
       case 'rspec-json':
         return new RspecJsonParser(options)
       case 'swift-xunit':
