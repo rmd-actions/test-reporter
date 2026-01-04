@@ -20,6 +20,8 @@ This [Github Action](https://github.com/features/actions) displays test results 
 - Java / [JUnit](https://junit.org/)
 - JavaScript / [JEST](https://jestjs.io/) / [Mocha](https://mochajs.org/)
 - Python / [pytest](https://docs.pytest.org/en/stable/) / [unittest](https://docs.python.org/3/library/unittest.html)
+- PHP / [PHPUnit](https://phpunit.de/) / [Nette Tester](https://tester.nette.org/)
+- Ruby / [RSpec](https://rspec.info/)
 - Swift / xUnit
 
 For more information see [Supported formats](#supported-formats) section.
@@ -146,6 +148,7 @@ jobs:
     #   java-junit
     #   jest-junit
     #   mocha-json
+    #   phpunit-junit
     #   python-xunit
     #   rspec-json
     #   swift-xunit
@@ -257,6 +260,20 @@ For more information see [dotnet test](https://docs.microsoft.com/en-us/dotnet/c
 </details>
 
 <details>
+  <summary>dotnet-nunit</summary>
+
+Test execution must be configured to generate [NUnit3](https://docs.nunit.org/articles/nunit/technical-notes/usage/Test-Result-XML-Format.html) XML test results.
+Install the [NUnit3TestAdapter](https://www.nuget.org/packages/NUnit3TestAdapter) package (required; it registers the `nunit` logger for `dotnet test`), then run tests with:
+
+`dotnet test --logger "nunit;LogFileName=test-results.xml"`
+
+Supported testing frameworks:
+- [NUnit](https://nunit.org/)
+
+For more information see [dotnet test](https://docs.microsoft.com/en-us/dotnet/core/tools/dotnet-test#examples)
+</details>
+
+<details>
   <summary>flutter-json</summary>
 
 Test run must be configured to use [JSON](https://github.com/dart-lang/test/blob/master/pkgs/test/doc/configuration.md#reporter) reporter.
@@ -297,6 +314,27 @@ Support for [JUnit](https://Junit.org/) XML is experimental - should work but it
 To have code annotations working properly, it's required your directory structure matches the package name.
 This is due to the fact Java stack traces don't contain a full path to the source file.
 Some heuristic was necessary to figure out the mapping between the line in the stack trace and an actual source file.
+</details>
+
+<details>
+  <summary>phpunit-junit</summary>
+
+[PHPUnit](https://phpunit.de/) can generate JUnit XML via CLI:
+`phpunit --log-junit reports/phpunit-junit.xml`
+
+</details>
+
+<details>
+  <summary>tester-junit</summary>
+
+[Nette Tester](https://tester.nette.org/) can generate JUnit XML via CLI:
+
+```bash
+tester -s -o junit tests/ > reports/tester-junit.xml
+```
+
+**Note:** Nette Tester's JUnit output doesn't include test suite names. The parser will use the report file name as the suite name and automatically group tests by directory structure.
+
 </details>
 
 <details>
@@ -364,6 +402,27 @@ pytest --junit-xml=test-report.xml
 ```
 
 For **unittest** support, use a test runner that outputs the JUnit report format, such as [unittest-xml-reporting](https://pypi.org/project/unittest-xml-reporting/).
+</details>
+
+<details>
+  <summary>rspec-json</summary>
+
+[RSpec](https://rspec.info/) testing framework support requires the usage of JSON formatter.
+You can configure RSpec to output JSON format by using the `--format json` option and redirecting to a file:
+
+```shell
+rspec --format json --out rspec-results.json
+```
+
+Or configure it in `.rspec` file:
+```
+--format json
+--out rspec-results.json
+```
+
+For more information see:
+- [RSpec documentation](https://rspec.info/)
+- [RSpec Formatters](https://relishapp.com/rspec/rspec-core/docs/formatters)
 </details>
 
 <details>

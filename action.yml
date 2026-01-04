@@ -1,6 +1,5 @@
 name: Test Reporter
-description: |
-  Shows test results in GitHub UI: .NET (xUnit, NUnit, MSTest), Dart, Flutter, Java (JUnit), JavaScript (JEST, Mocha)
+description: Displays test results from popular testing frameworks directly in GitHub
 author: Michal Dorner <dorner.michal@gmail.com>
 inputs:
   artifact:
@@ -33,6 +32,8 @@ inputs:
         - java-junit
         - jest-junit
         - mocha-json
+        - tester-junit
+        - phpunit-junit
         - python-xunit
         - rspec-json
         - swift-xunit
