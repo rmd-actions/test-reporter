@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.5.0
+* Feature: Add Nette Tester support with `tester-junit` reporter https://github.com/dorny/test-reporter/pull/707
+* Maintenance: Bump actions/upload-artifact from 5 to 6 https://github.com/dorny/test-reporter/pull/695
+
+## 2.4.0
+* Feature: Add PHPUnit support with JUnit XML dialect parser https://github.com/dorny/test-reporter/pull/422
+* Feature: Add JUnit XML sample files and tests for validation https://github.com/dorny/test-reporter/pull/701
+* Fix: Refactor deprecated `String.substr()` function to use `String.substring()` https://github.com/dorny/test-reporter/pull/704
+
 ## 2.3.0
 * Feature: Add Python support with `python-xunit` reporter (pytest) https://github.com/dorny/test-reporter/pull/643
 * Feature: Add pytest traceback parsing and `directory-mapping` option https://github.com/dorny/test-reporter/pull/238
