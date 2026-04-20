@@ -1,9 +1,9 @@
-import {ParseOptions, TestParser} from '../../test-parser'
+import {ParseOptions, TestParser} from '../../test-parser.js'
 import {parseStringPromise} from 'xml2js'
 
-import {JunitReport, TestCase, TestSuite} from './jest-junit-types'
-import {getExceptionSource} from '../../utils/node-utils'
-import {getBasePath, normalizeFilePath} from '../../utils/path-utils'
+import {JunitReport, TestCase, TestSuite} from './jest-junit-types.js'
+import {getExceptionSource} from '../../utils/node-utils.js'
+import {getBasePath, normalizeFilePath} from '../../utils/path-utils.js'
 
 import {
   TestExecutionResult,
@@ -12,7 +12,7 @@ import {
   TestGroupResult,
   TestCaseResult,
   TestCaseError
-} from '../../test-results'
+} from '../../test-results.js'
 
 export class JestJunitParser implements TestParser {
   assumedWorkDir: string | undefined
@@ -106,7 +106,7 @@ export class JestJunitParser implements TestParser {
     path = normalizeFilePath(path)
     const workDir = this.getWorkDir(path)
     if (workDir !== undefined && path.startsWith(workDir)) {
-      path = path.substr(workDir.length)
+      path = path.substring(workDir.length)
     }
     return path
   }

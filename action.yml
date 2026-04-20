@@ -32,6 +32,8 @@ inputs:
         - java-junit
         - jest-junit
         - mocha-json
+        - tester-junit
+        - phpunit-junit
         - python-xunit
         - rspec-json
         - swift-xunit
