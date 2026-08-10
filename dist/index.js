@@ -56758,7 +56758,7 @@ function table(headers, align, ...rows) {
     return [headerRow, alignRow, contentRows].join('\n');
 }
 function tableEscape(content) {
-    return content.toString().replace('|', '\\|');
+    return content.toString().replace(/\|/g, '\\|');
 }
 function fixEol(text) {
     return text?.replace(/\r/g, '') ?? '';
