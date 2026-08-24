@@ -1792,6 +1792,18 @@ module.exports = function (/**String*/ input, /** object */ options) {
     // instanciate utils filesystem
     const filetools = new Utils(opts);
 
+    // Restore the archived permissions on extracted directories. This has to run
+    // after a directory's contents are written: applying a restrictive mode
+    // (e.g. 0o500) up front would stop us writing the files it contains. Applying
+    // the deepest paths first keeps parent directories traversable while their
+    // children are updated (issue #530).
+    const applyDirAttributes = (dirEntries) => {
+        dirEntries
+            .filter((d) => d.attr)
+            .sort((a, b) => b.path.length - a.path.length)
+            .forEach((d) => filetools.fs.chmodSync(d.path, d.attr));
+    };
+
     if (typeof opts.decoder !== "object" || typeof opts.decoder.encode !== "function" || typeof opts.decoder.decode !== "function") {
         opts.decoder = Utils.decoder;
     }
@@ -1946,6 +1958,7 @@ module.exports = function (/**String*/ input, /** object */ options) {
          * Remove the entry from the file or the entry and all it's nested directories and files if the given entry is a directory
          *
          * @param {ZipEntry|string} entry
+         * @param {boolean} withsubfolders
          * @returns {void}
          */
         deleteFile: function (entry, withsubfolders = true) {
@@ -2230,7 +2243,7 @@ module.exports = function (/**String*/ input, /** object */ options) {
         addLocalFolderAsync2: function (options, callback) {
             const self = this;
             options = typeof options === "object" ? options : { localPath: options };
-            localPath = pth.resolve(fixPath(options.localPath));
+            const localPath = pth.resolve(fixPath(options.localPath));
             let { zipPath, filter, namefix } = options;
 
             if (filter instanceof RegExp) {
@@ -2249,7 +2262,7 @@ module.exports = function (/**String*/ input, /** object */ options) {
             zipPath = zipPath ? fixPath(zipPath) : "";
 
             // Check Namefix function
-            if (namefix == "latin1") {
+            if (namefix === "latin1") {
                 namefix = (str) =>
                     str
                         .normalize("NFD")
@@ -2425,7 +2438,7 @@ module.exports = function (/**String*/ input, /** object */ options) {
 
             var entryName = canonical(item.entryName);
 
-            var target = sanitize(targetPath, outFileName && !item.isDirectory ? outFileName : maintainEntryPath ? entryName : pth.basename(entryName));
+            var target = sanitize(targetPath, outFileName && !item.isDirectory ? canonical(outFileName) : maintainEntryPath ? entryName : pth.basename(entryName));
 
             if (item.isDirectory) {
                 var children = _zip.getEntryChildren(item);
@@ -2435,8 +2448,12 @@ module.exports = function (/**String*/ input, /** object */ options) {
                     if (!content) {
                         throw Utils.Errors.CANT_EXTRACT_FILE();
                     }
-                    var name = canonical(child.entryName);
-                    var childName = sanitize(targetPath, maintainEntryPath ? name : pth.basename(name));
+                    // When not maintaining the full entry path, keep each child's path
+                    // relative to the extracted directory (drop the directory's own
+                    // prefix) instead of flattening every file to its basename, which
+                    // collapsed subdirectories together (issue #306).
+                    var name = canonical(maintainEntryPath ? child.entryName : child.entryName.substring(item.entryName.length));
+                    var childName = sanitize(targetPath, name);
                     // The reverse operation for attr depend on method addFile()
                     const fileAttr = keepOriginalPermission ? child.header.fileAttr : undefined;
                     filetools.writeFileTo(childName, content, overwrite, fileAttr);
@@ -2466,12 +2483,14 @@ module.exports = function (/**String*/ input, /** object */ options) {
                 return false;
             }
 
-            for (var entry in _zip.entries) {
+            for (var entry of _zip.entries) {
                 try {
                     if (entry.isDirectory) {
                         continue;
                     }
-                    var content = _zip.entries[entry].getData(pass);
+                    // was `_zip.entries[entry]` (indexing the array with an entry
+                    // object -> undefined -> threw -> test() always returned false)
+                    var content = entry.getData(pass);
                     if (!content) {
                         return false;
                     }
@@ -2498,10 +2517,13 @@ module.exports = function (/**String*/ input, /** object */ options) {
             overwrite = get_Bool(false, overwrite);
             if (!_zip) throw Utils.Errors.NO_ZIP();
 
+            const dirEntries = [];
             _zip.entries.forEach(function (entry) {
                 var entryName = sanitize(targetPath, canonical(entry.entryName));
                 if (entry.isDirectory) {
                     filetools.makeDir(entryName);
+                    // defer restoring the directory permission until its files are written
+                    if (keepOriginalPermission) dirEntries.push({ path: entryName, attr: entry.header.fileAttr });
                     return;
                 }
                 var content = entry.getData(pass);
@@ -2512,11 +2534,15 @@ module.exports = function (/**String*/ input, /** object */ options) {
                 const fileAttr = keepOriginalPermission ? entry.header.fileAttr : undefined;
                 filetools.writeFileTo(entryName, content, overwrite, fileAttr);
                 try {
+                    // best-effort: an invalid date in the archive or a filesystem that
+                    // rejects utimes must not fail extraction of already-written content (issue #379)
                     filetools.fs.utimesSync(entryName, entry.header.time, entry.header.time);
                 } catch (err) {
-                    throw Utils.Errors.CANT_EXTRACT_FILE();
+                    /* ignore timestamp failures */
                 }
             });
+
+            applyDirAttributes(dirEntries);
         },
 
         /**
@@ -2567,19 +2593,40 @@ module.exports = function (/**String*/ input, /** object */ options) {
 
             // Create directory entries first synchronously
             // this prevents race condition and assures folders are there before writing files
+            const deferredDirAttr = [];
             for (const entry of dirEntries) {
                 const dirPath = getPath(entry);
                 // The reverse operation for attr depend on method addFile()
                 const dirAttr = keepOriginalPermission ? entry.header.fileAttr : undefined;
                 try {
                     filetools.makeDir(dirPath);
-                    if (dirAttr) filetools.fs.chmodSync(dirPath, dirAttr);
-                    // in unix timestamp will change if files are later added to folder, but still
-                    filetools.fs.utimesSync(dirPath, entry.header.time, entry.header.time);
                 } catch (er) {
                     callback(getError("Unable to create folder", dirPath));
+                    continue;
+                }
+                // defer restoring the directory permission until its files are written:
+                // a restrictive mode applied now would block writing them
+                if (dirAttr) deferredDirAttr.push({ path: dirPath, attr: dirAttr });
+                try {
+                    // in unix timestamp will change if files are later added to folder, but still.
+                    // best-effort: a utimes failure must not abort extraction (issue #379)
+                    filetools.fs.utimesSync(dirPath, entry.header.time, entry.header.time);
+                } catch (er) {
+                    /* ignore timestamp failures */
                 }
             }
+
+            // restore directory permissions once every file has been extracted
+            const done = (err) => {
+                if (!err) {
+                    try {
+                        applyDirAttributes(deferredDirAttr);
+                    } catch (er) {
+                        return callback(getError("Unable to set folder permissions", er.path || ""));
+                    }
+                }
+                callback(err);
+            };
 
             fileEntries.reverse().reduce(function (next, entry) {
                 return function (err) {
@@ -2598,21 +2645,19 @@ module.exports = function (/**String*/ input, /** object */ options) {
                                 const fileAttr = keepOriginalPermission ? entry.header.fileAttr : undefined;
                                 filetools.writeFileToAsync(filePath, content, overwrite, fileAttr, function (succ) {
                                     if (!succ) {
-                                        next(getError("Unable to write file", filePath));
+                                        return next(getError("Unable to write file", filePath));
                                     }
-                                    filetools.fs.utimes(filePath, entry.header.time, entry.header.time, function (err_2) {
-                                        if (err_2) {
-                                            next(getError("Unable to set times", filePath));
-                                        } else {
-                                            next();
-                                        }
+                                    filetools.fs.utimes(filePath, entry.header.time, entry.header.time, function () {
+                                        // best-effort: a utimes failure must not abort extraction
+                                        // of already-written content (issue #379)
+                                        next();
                                     });
                                 });
                             }
                         });
                     }
                 };
-            }, callback)();
+            }, done)();
         },
 
         /**
@@ -2788,6 +2833,7 @@ module.exports = function () {
             switch (val) {
                 case Constants.STORED:
                     this.version = 10;
+                    break;
                 case Constants.DEFLATED:
                 default:
                     this.version = 20;
@@ -2990,7 +3036,11 @@ module.exports = function () {
             // version needed to extract
             data.writeUInt16LE(_version, Constants.LOCVER);
             // general purpose bit flag
-            data.writeUInt16LE(_flags, Constants.LOCFLG);
+            // clear bit 3 (data descriptor): we always write the real crc-32
+            // and sizes into this local header, so no trailing descriptor is
+            // emitted. Leaving the flag set would make the output unreadable
+            // (see issue #555).
+            data.writeUInt16LE(_flags & ~Constants.FLG_DESC, Constants.LOCFLG);
             // compression method
             data.writeUInt16LE(_method, Constants.LOCHOW);
             // modification time (2 bytes time, 2 bytes date)
@@ -3018,7 +3068,9 @@ module.exports = function () {
             // version needed to extract
             data.writeUInt16LE(_version, Constants.CENVER);
             // encrypt, decrypt flags
-            data.writeUInt16LE(_flags, Constants.CENFLG);
+            // clear bit 3 (data descriptor) to match the local header we emit
+            // (real crc/sizes are written, no descriptor follows the data) — issue #555
+            data.writeUInt16LE(_flags & ~Constants.FLG_DESC, Constants.CENFLG);
             // compression method
             data.writeUInt16LE(_method, Constants.CENHOW);
             // modification time (2 bytes time, 2 bytes date)
@@ -3103,6 +3155,8 @@ module.exports = function () {
         _offset = 0,
         _commentLength = 0;
 
+    const needsZip64 = () => _volumeEntries > Constants.EF_ZIP64_OR_16 || _totalEntries > Constants.EF_ZIP64_OR_16 || _size > Constants.EF_ZIP64_OR_32 || _offset > Constants.EF_ZIP64_OR_32;
+
     return {
         get diskEntries() {
             return _volumeEntries;
@@ -3140,7 +3194,7 @@ module.exports = function () {
         },
 
         get mainHeaderSize() {
-            return Constants.ENDHDR + _commentLength;
+            return (needsZip64() ? Constants.ZIP64HDR + Constants.END64HDR : 0) + Constants.ENDHDR + _commentLength;
         },
 
         loadFromBinary: function (/*Buffer*/ data) {
@@ -3170,7 +3224,7 @@ module.exports = function () {
                 // total number of entries
                 _totalEntries = Utils.readBigUInt64LE(data, Constants.ZIP64TOT);
                 // central directory size in bytes
-                _size = Utils.readBigUInt64LE(data, Constants.ZIP64SIZE);
+                _size = Utils.readBigUInt64LE(data, Constants.ZIP64SIZB);
                 // offset of first CEN header
                 _offset = Utils.readBigUInt64LE(data, Constants.ZIP64OFF);
 
@@ -3179,22 +3233,67 @@ module.exports = function () {
         },
 
         toBinary: function () {
-            var b = Buffer.alloc(Constants.ENDHDR + _commentLength);
+            if (!needsZip64()) {
+                var b = Buffer.alloc(Constants.ENDHDR + _commentLength);
+                // "PK 05 06" signature
+                b.writeUInt32LE(Constants.ENDSIG, 0);
+                b.writeUInt32LE(0, 4);
+                // number of entries on this volume
+                b.writeUInt16LE(_volumeEntries, Constants.ENDSUB);
+                // total number of entries
+                b.writeUInt16LE(_totalEntries, Constants.ENDTOT);
+                // central directory size in bytes
+                b.writeUInt32LE(_size, Constants.ENDSIZ);
+                // offset of first CEN header
+                b.writeUInt32LE(_offset, Constants.ENDOFF);
+                // zip file comment length
+                b.writeUInt16LE(_commentLength, Constants.ENDCOM);
+                // fill comment memory with spaces so no garbage is left there
+                b.fill(" ", Constants.ENDHDR);
+
+                return b;
+            }
+
+            var b = Buffer.alloc(this.mainHeaderSize);
+            let offset = 0;
+
+            // Zip64 end of central directory record.
+            b.writeUInt32LE(Constants.ZIP64SIG, offset);
+            Utils.writeBigUInt64LE(b, Constants.ZIP64HDR - Constants.ZIP64LEAD, offset + Constants.ZIP64SIZE);
+            b.writeUInt16LE(45, offset + Constants.ZIP64VEM);
+            b.writeUInt16LE(45, offset + Constants.ZIP64VER);
+            b.writeUInt32LE(0, offset + Constants.ZIP64DSK);
+            b.writeUInt32LE(0, offset + Constants.ZIP64DSKDIR);
+            Utils.writeBigUInt64LE(b, _volumeEntries, offset + Constants.ZIP64SUB);
+            Utils.writeBigUInt64LE(b, _totalEntries, offset + Constants.ZIP64TOT);
+            Utils.writeBigUInt64LE(b, _size, offset + Constants.ZIP64SIZB);
+            Utils.writeBigUInt64LE(b, _offset, offset + Constants.ZIP64OFF);
+
+            const zip64EndOffset = _offset + _size;
+            offset += Constants.ZIP64HDR;
+
+            // Zip64 end of central directory locator.
+            b.writeUInt32LE(Constants.END64SIG, offset);
+            b.writeUInt32LE(0, offset + Constants.END64START);
+            Utils.writeBigUInt64LE(b, zip64EndOffset, offset + Constants.END64OFF);
+            b.writeUInt32LE(1, offset + Constants.END64NUMDISKS);
+            offset += Constants.END64HDR;
+
             // "PK 05 06" signature
-            b.writeUInt32LE(Constants.ENDSIG, 0);
-            b.writeUInt32LE(0, 4);
+            b.writeUInt32LE(Constants.ENDSIG, offset);
+            b.writeUInt32LE(0, offset + 4);
             // number of entries on this volume
-            b.writeUInt16LE(_volumeEntries, Constants.ENDSUB);
+            b.writeUInt16LE(Math.min(_volumeEntries, Constants.EF_ZIP64_OR_16), offset + Constants.ENDSUB);
             // total number of entries
-            b.writeUInt16LE(_totalEntries, Constants.ENDTOT);
+            b.writeUInt16LE(Math.min(_totalEntries, Constants.EF_ZIP64_OR_16), offset + Constants.ENDTOT);
             // central directory size in bytes
-            b.writeUInt32LE(_size, Constants.ENDSIZ);
+            b.writeUInt32LE(Math.min(_size, Constants.EF_ZIP64_OR_32), offset + Constants.ENDSIZ);
             // offset of first CEN header
-            b.writeUInt32LE(_offset, Constants.ENDOFF);
+            b.writeUInt32LE(Math.min(_offset, Constants.EF_ZIP64_OR_32), offset + Constants.ENDOFF);
             // zip file comment length
-            b.writeUInt16LE(_commentLength, Constants.ENDCOM);
+            b.writeUInt16LE(_commentLength, offset + Constants.ENDCOM);
             // fill comment memory with spaces so no garbage is left there
-            b.fill(" ", Constants.ENDHDR);
+            b.fill(" ", offset + Constants.ENDHDR);
 
             return b;
         },
@@ -3279,7 +3378,7 @@ exports.ZipCrypto = __nccwpck_require__(2689);
 /***/ 9540:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-const version = +(process.versions ? process.versions.node : "").split(".")[0] || 0;
+const version = +(process?.versions?.node ?? "").split(".")[0] || 0;
 
 module.exports = function (/*Buffer*/ inbuf, /*number*/ expectedLength) {
     var zlib = __nccwpck_require__(3106);
@@ -3937,39 +4036,51 @@ Utils.prototype.writeFileToAsync = function (/*String*/ path, /*Buffer*/ content
         if (exist && !overwrite) return callback(false);
 
         self.fs.stat(path, function (err, stat) {
-            if (exist && stat.isDirectory()) {
+            if (exist && stat && stat.isDirectory()) {
                 return callback(false);
             }
 
             var folder = pth.dirname(path);
             self.fs.exists(folder, function (exists) {
-                if (!exists) self.makeDir(folder);
+                if (!exists) {
+                    // makeDir is synchronous and can throw (e.g. EACCES); report failure
+                    // rather than letting it escape this callback as an uncaught exception
+                    try {
+                        self.makeDir(folder);
+                    } catch (e) {
+                        return callback(false);
+                    }
+                }
+
+                // write the content to an open descriptor, then apply the attributes
+                const writeToFd = function (fd) {
+                    self.fs.write(fd, content, 0, content.length, 0, function (writeErr) {
+                        self.fs.close(fd, function () {
+                            // surface write failures instead of silently reporting success (issue #402)
+                            if (writeErr) return callback(false);
+                            self.fs.chmod(path, attr || 0o666, function () {
+                                callback(true);
+                            });
+                        });
+                    });
+                };
 
                 self.fs.open(path, "w", 0o666, function (err, fd) {
                     if (err) {
+                        // the target may exist but be read-only: make it writable and retry once
                         self.fs.chmod(path, 0o666, function () {
-                            self.fs.open(path, "w", 0o666, function (err, fd) {
-                                self.fs.write(fd, content, 0, content.length, 0, function () {
-                                    self.fs.close(fd, function () {
-                                        self.fs.chmod(path, attr || 0o666, function () {
-                                            callback(true);
-                                        });
-                                    });
-                                });
+                            self.fs.open(path, "w", 0o666, function (retryErr, fd) {
+                                // Previously the retry error was ignored and an undefined fd was
+                                // passed to fs.write, throwing an uncaught ERR_INVALID_ARG_TYPE that
+                                // crashed the process (issues #470, #459, #402). Report failure instead.
+                                if (retryErr || !fd) return callback(false);
+                                writeToFd(fd);
                             });
                         });
                     } else if (fd) {
-                        self.fs.write(fd, content, 0, content.length, 0, function () {
-                            self.fs.close(fd, function () {
-                                self.fs.chmod(path, attr || 0o666, function () {
-                                    callback(true);
-                                });
-                            });
-                        });
+                        writeToFd(fd);
                     } else {
-                        self.fs.chmod(path, attr || 0o666, function () {
-                            callback(true);
-                        });
+                        callback(false);
                     }
                 });
             });
@@ -3980,7 +4091,7 @@ Utils.prototype.writeFileToAsync = function (/*String*/ path, /*Buffer*/ content
 Utils.prototype.findFiles = function (/*String*/ path) {
     const self = this;
 
-    function findSync(/*String*/ dir, /*RegExp*/ pattern, /*Boolean*/ recursive) {
+    function findSync(/*String*/ dir, /*RegExp*/ pattern, /*Boolean*/ recursive, /*Set*/ visited) {
         if (typeof pattern === "boolean") {
             recursive = pattern;
             pattern = undefined;
@@ -3994,12 +4105,22 @@ Utils.prototype.findFiles = function (/*String*/ path) {
                 files.push(pth.normalize(path) + (stat.isDirectory() ? self.sep : ""));
             }
 
-            if (stat.isDirectory() && recursive) files = files.concat(findSync(path, pattern, recursive));
+            if (stat.isDirectory() && recursive) {
+                // Descend by resolved real path and skip directories we have already
+                // visited. This stops a symlink that points back to an ancestor from
+                // recursing forever until the path fails with ELOOP / ENAMETOOLONG
+                // (issue #541).
+                const realDir = self.fs.realpathSync(path);
+                if (!visited.has(realDir)) {
+                    visited.add(realDir);
+                    files = files.concat(findSync(path, pattern, recursive, visited));
+                }
+            }
         });
         return files;
     }
 
-    return findSync(path, undefined, true);
+    return findSync(path, undefined, true, new Set([self.fs.realpathSync(path)]));
 };
 
 /**
@@ -4017,29 +4138,54 @@ Utils.prototype.findFiles = function (/*String*/ path) {
  */
 Utils.prototype.findFilesAsync = function (dir, cb) {
     const self = this;
-    let results = [];
-    self.fs.readdir(dir, function (err, list) {
-        if (err) return cb(err);
-        let list_length = list.length;
-        if (!list_length) return cb(null, results);
-        list.forEach(function (file) {
-            file = pth.join(dir, file);
-            self.fs.stat(file, function (err, stat) {
-                if (err) return cb(err);
-                if (stat) {
-                    results.push(pth.normalize(file) + (stat.isDirectory() ? self.sep : ""));
-                    if (stat.isDirectory()) {
-                        self.findFilesAsync(file, function (err, res) {
-                            if (err) return cb(err);
-                            results = results.concat(res);
-                            if (!--list_length) cb(null, results);
-                        });
-                    } else {
-                        if (!--list_length) cb(null, results);
+    const results = [];
+    let finished = false;
+    const finish = function (err) {
+        if (finished) return;
+        finished = true;
+        cb(err, err ? undefined : results);
+    };
+
+    // Descend by resolved real path and skip directories already visited, so a
+    // symlink pointing back to an ancestor cannot recurse forever (issue #541).
+    const walk = function (dir, visited, done) {
+        self.fs.readdir(dir, function (err, list) {
+            if (err) return done(err);
+            let pending = list.length;
+            if (!pending) return done();
+            list.forEach(function (name) {
+                const file = pth.join(dir, name);
+                self.fs.stat(file, function (err, stat) {
+                    if (err) return done(err);
+                    if (!stat) {
+                        if (!--pending) done();
+                        return;
                     }
-                }
+                    results.push(pth.normalize(file) + (stat.isDirectory() ? self.sep : ""));
+                    if (!stat.isDirectory()) {
+                        if (!--pending) done();
+                        return;
+                    }
+                    self.fs.realpath(file, function (err, realDir) {
+                        if (err) return done(err);
+                        if (visited.has(realDir)) {
+                            if (!--pending) done();
+                            return;
+                        }
+                        visited.add(realDir);
+                        walk(file, visited, function (err) {
+                            if (err) return done(err);
+                            if (!--pending) done();
+                        });
+                    });
+                });
             });
         });
+    };
+
+    self.fs.realpath(dir, function (err, realDir) {
+        if (err) return finish(err);
+        walk(dir, new Set([realDir]), finish);
     });
 };
 
@@ -4120,13 +4266,13 @@ Utils.findLast = function (arr, callback) {
     return void 0;
 };
 
-// make abolute paths taking prefix as root folder
+// make absolute paths taking prefix as root folder
 Utils.sanitize = function (/*string*/ prefix, /*string*/ name) {
     prefix = pth.resolve(pth.normalize(prefix));
     var parts = name.split("/");
     for (var i = 0, l = parts.length; i < l; i++) {
         var path = pth.normalize(pth.join(prefix, parts.slice(i, l).join(pth.sep)));
-        if (path.indexOf(prefix) === 0) {
+        if (path === prefix || path.startsWith(prefix + pth.sep)) {
             return path;
         }
     }
@@ -4149,6 +4295,13 @@ Utils.readBigUInt64LE = function (/*Buffer*/ buffer, /*int*/ index) {
     const lo = buffer.readUInt32LE(index);
     const hi = buffer.readUInt32LE(index + 4);
     return hi * 0x100000000 + lo;
+};
+
+Utils.writeBigUInt64LE = function (/*Buffer*/ buffer, /*Number*/ value, /*int*/ index) {
+    const lo = value >>> 0;
+    const hi = Math.floor(value / 0x100000000) >>> 0;
+    buffer.writeUInt32LE(lo, index);
+    buffer.writeUInt32LE(hi, index + 4);
 };
 
 Utils.fromDOS2Date = function (val) {
@@ -4205,48 +4358,23 @@ module.exports = function (/** object */ options, /*Buffer*/ input) {
     }
 
     function crc32OK(data) {
-        // if bit 3 (0x08) of the general-purpose flags field is set, then the CRC-32 and file sizes are not known when the local header is written
-        if (!_centralHeader.flags_desc && !_centralHeader.localHeader.flags_desc) {
-            if (Utils.crc32(data) !== _centralHeader.localHeader.crc) {
-                return false;
-            }
-        } else {
-            const descriptor = {};
-            const dataEndOffset = _centralHeader.realDataOffset + _centralHeader.compressedSize;
-            // no descriptor after compressed data, instead new local header
-            if (input.readUInt32LE(dataEndOffset) == Constants.LOCSIG || input.readUInt32LE(dataEndOffset) == Constants.CENSIG) {
-                throw Utils.Errors.DESCRIPTOR_NOT_EXIST();
-            }
+        // When bit 3 (0x08) of the general-purpose flags is set, the crc-32 and
+        // sizes were unknown when the local file header was written, so that
+        // header carries placeholder zeros and the real values are repeated in a
+        // data descriptor after the compressed data. adm-zip always parses the
+        // central directory, whose header holds the authoritative crc-32 and
+        // sizes, so we validate the payload against that value.
+        //
+        // Earlier versions instead located and parsed the trailing descriptor and
+        // threw when it was absent or in an unexpected shape. Many valid archives
+        // set the descriptor flag but write the real crc/sizes into the local and
+        // central headers without emitting a descriptor (or write one we did not
+        // recognise), so that strict handling rejected readable zips
+        // (issues #533, #548, #554). Trusting the central-directory crc keeps the
+        // integrity check while accepting those archives.
+        const expectedCrc = _centralHeader.flags_desc || _centralHeader.localHeader.flags_desc ? _centralHeader.crc : _centralHeader.localHeader.crc;
 
-            // get decriptor data
-            if (input.readUInt32LE(dataEndOffset) == Constants.EXTSIG) {
-                // descriptor with signature
-                descriptor.crc = input.readUInt32LE(dataEndOffset + Constants.EXTCRC);
-                descriptor.compressedSize = input.readUInt32LE(dataEndOffset + Constants.EXTSIZ);
-                descriptor.size = input.readUInt32LE(dataEndOffset + Constants.EXTLEN);
-            } else if (input.readUInt16LE(dataEndOffset + 12) === 0x4b50) {
-                // descriptor without signature (we check is new header starting where we expect)
-                descriptor.crc = input.readUInt32LE(dataEndOffset + Constants.EXTCRC - 4);
-                descriptor.compressedSize = input.readUInt32LE(dataEndOffset + Constants.EXTSIZ - 4);
-                descriptor.size = input.readUInt32LE(dataEndOffset + Constants.EXTLEN - 4);
-            } else {
-                throw Utils.Errors.DESCRIPTOR_UNKNOWN();
-            }
-
-            // check data integrity
-            if (descriptor.compressedSize !== _centralHeader.compressedSize || descriptor.size !== _centralHeader.size || descriptor.crc !== _centralHeader.crc) {
-                throw Utils.Errors.DESCRIPTOR_FAULTY();
-            }
-            if (Utils.crc32(data) !== descriptor.crc) {
-                return false;
-            }
-
-            // @TODO: zip64 bit descriptor fields
-            // if bit 3 is set and any value in local header "zip64 Extended information" extra field are set 0 (place holder)
-            // then 64-bit descriptor format is used instead of 32-bit
-            // central header - "zip64 Extended information" extra field should store real values and not place holders
-        }
-        return true;
+        return Utils.crc32(data) === expectedCrc;
     }
 
     function decompress(/*Boolean*/ async, /*Function*/ callback, /*String, Buffer*/ pass) {
@@ -4276,10 +4404,16 @@ module.exports = function (/** object */ options, /*Buffer*/ input) {
             compressedData = Methods.ZipCrypto.decrypt(compressedData, _centralHeader, pass);
         }
 
-        var data = Buffer.alloc(_centralHeader.size);
+        var data;
 
         switch (_centralHeader.method) {
             case Utils.Constants.STORED:
+                // STORED entries are not compressed, so the uncompressed output is
+                // exactly the bytes present in the archive. Allocate from the real
+                // data length rather than the attacker-declared central-directory
+                // size, otherwise a tiny archive can declare a huge size and force a
+                // multi-gigabyte allocation before any validation (CVE-2026-39244).
+                data = Buffer.alloc(compressedData.length);
                 compressedData.copy(data);
                 if (!crc32OK(data)) {
                     if (async && callback) callback(data, Utils.Errors.BAD_CRC()); //si added error
@@ -4290,17 +4424,19 @@ module.exports = function (/** object */ options, /*Buffer*/ input) {
                     return data;
                 }
             case Utils.Constants.DEFLATED:
+                // Do not pre-allocate the declared uncompressed size. The inflater
+                // grows its output buffer as zlib emits data and caps the total at
+                // the declared size (maxOutputLength), so a bogus size can no longer
+                // trigger an eager allocation before the data is read (CVE-2026-39244).
                 var inflater = new Methods.Inflater(compressedData, _centralHeader.size);
                 if (!async) {
-                    const result = inflater.inflate(data);
-                    result.copy(data, 0);
+                    data = inflater.inflate();
                     if (!crc32OK(data)) {
                         throw Utils.Errors.BAD_CRC(`"${decoder.decode(_entryName)}"`);
                     }
                     return data;
                 } else {
                     inflater.inflateAsync(function (result) {
-                        result.copy(result, 0);
                         if (callback) {
                             if (!crc32OK(result)) {
                                 callback(result, Utils.Errors.BAD_CRC()); //si added error
@@ -4456,10 +4592,12 @@ module.exports = function (/** object */ options, /*Buffer*/ input) {
         },
 
         get name() {
-            var n = decoder.decode(_entryName);
+            const n = decoder.decode(_entryName);
+            // For directories the name is the last path segment; drop the trailing
+            // separator first so "a/b/c/" yields "c" and not "" (issue #466).
             return _isDirectory
                 ? n
-                      .substr(n.length - 1)
+                      .replace(/[/\\]$/, "")
                       .split("/")
                       .pop()
                 : n.split("/").pop();
@@ -4592,7 +4730,10 @@ const Utils = __nccwpck_require__(5391);
 
 module.exports = function (/*Buffer|null*/ inBuffer, /** object */ options) {
     var entryList = [],
-        entryTable = {},
+        // prototype-less: entry names come from untrusted input, so keys like
+        // "__proto__" or "constructor" must be plain data, not touch the prototype
+        // chain (which otherwise crashes addFile and hides such entries)
+        entryTable = Object.create(null),
         _comment = Buffer.alloc(0),
         mainHeader = new Headers.MainHeader(),
         loadedEntries = false;
@@ -4642,7 +4783,7 @@ module.exports = function (/*Buffer|null*/ inBuffer, /** object */ options) {
 
     function readEntries() {
         loadedEntries = true;
-        entryTable = {};
+        entryTable = Object.create(null);
         if (mainHeader.diskEntries > (inBuffer.length - mainHeader.offset) / Utils.Constants.CENHDR) {
             throw Utils.Errors.DISK_ENTRY_TOO_LARGE();
         }
@@ -4719,7 +4860,14 @@ module.exports = function (/*Buffer|null*/ inBuffer, /** object */ options) {
 
     function sortEntries() {
         if (entryList.length > 1 && !noSort) {
-            entryList.sort((a, b) => a.entryName.toLowerCase().localeCompare(b.entryName.toLowerCase()));
+            // Decode + lowercase each name once rather than on every comparison:
+            // the entryName getter re-decodes the underlying buffer on each access,
+            // so the previous inline comparator did O(n log n) redundant decoding.
+            // Ordering is unchanged (same localeCompare on the same keys).
+            entryList = entryList
+                .map((entry) => ({ entry, key: entry.entryName.toLowerCase() }))
+                .sort((a, b) => a.key.localeCompare(b.key))
+                .map((pair) => pair.entry);
         }
     }
 
@@ -4931,7 +5079,7 @@ module.exports = function (/*Buffer|null*/ inBuffer, /** object */ options) {
             // write main header
             const mh = mainHeader.toBinary();
             if (_comment) {
-                _comment.copy(mh, Utils.Constants.ENDHDR); // add zip file comment
+                _comment.copy(mh, mh.length - _comment.length); // add zip file comment
             }
             mh.copy(outBuffer, dindex);
 
@@ -5009,7 +5157,7 @@ module.exports = function (/*Buffer|null*/ inBuffer, /** object */ options) {
 
                         const mh = mainHeader.toBinary();
                         if (_comment) {
-                            _comment.copy(mh, Utils.Constants.ENDHDR); // add zip file comment
+                            _comment.copy(mh, mh.length - _comment.length); // add zip file comment
                         }
 
                         mh.copy(outBuffer, dindex); // write main header
@@ -11358,7 +11506,15 @@ const parseRepeatedExtglob = (pattern, requireEnd = true) => {
   }
 };
 
-const getStarExtglobSequenceOutput = pattern => {
+const buildCharClassStar = chars => {
+  const source = chars.length === 1
+    ? utils.escapeRegex(chars[0])
+    : `[${chars.map(ch => utils.escapeRegex(ch)).join('')}]`;
+
+  return `${source}*`;
+};
+
+const getStarExtglobSequenceChars = pattern => {
   let index = 0;
   const chars = [];
 
@@ -11387,11 +11543,7 @@ const getStarExtglobSequenceOutput = pattern => {
     return;
   }
 
-  const source = chars.length === 1
-    ? utils.escapeRegex(chars[0])
-    : `[${chars.map(ch => utils.escapeRegex(ch)).join('')}]`;
-
-  return `${source}*`;
+  return chars;
 };
 
 const repeatedExtglobRecursion = pattern => {
@@ -11430,15 +11582,41 @@ const analyzeRepeatedExtglob = (body, options) => {
     }
   }
 
+  // A repeated extglob is "risky" (prone to catastrophic backtracking) when a
+  // branch is itself a `*(...)` sequence, since that nests an unbounded quantifier
+  // inside the outer `+(...)`/`*(...)`. When *every* branch reduces to single
+  // characters we can emit one flat, ReDoS-safe character class that preserves the
+  // meaning of ALL branches (e.g. `+(*(a)|*(b))` -> `[ab]*`), rather than dropping
+  // every branch but the first.
+  const safeChars = [];
+  let sawStarSequence = false;
+  let combinable = true;
+
   for (const branch of branches) {
-    const safeOutput = getStarExtglobSequenceOutput(branch);
-    if (safeOutput) {
-      return { risky: true, safeOutput };
+    const chars = getStarExtglobSequenceChars(branch);
+    if (chars) {
+      sawStarSequence = true;
+      safeChars.push(...chars);
+      continue;
     }
+
+    const literal = normalizeSimpleBranch(branch);
+    if (literal && literal.length === 1) {
+      safeChars.push(literal);
+      continue;
+    }
+
+    combinable = false;
 
     if (repeatedExtglobRecursion(branch) > max) {
       return { risky: true };
     }
+  }
+
+  if (sawStarSequence) {
+    return combinable
+      ? { risky: true, safeOutput: buildCharClassStar([...new Set(safeChars)]) }
+      : { risky: true };
   }
 
   return { risky: false };
@@ -12541,6 +12719,18 @@ const isObject = val => val && typeof val === 'object' && !Array.isArray(val);
  * const isMatch = picomatch('*.!(*a)');
  * console.log(isMatch('a.a')); //=> false
  * console.log(isMatch('a.b')); //=> true
+ *
+ * // For environments without `node.js`, `picomatch/posix` provides you a dependency-free matcher, without automatic OS detection.
+ * const picomatch = require('picomatch/posix');
+ * // the same API, defaulting to posix paths
+ * const isMatch = picomatch('a/*');
+ * console.log(isMatch('a\\b')); //=> false
+ * console.log(isMatch('a/b')); //=> true
+ *
+ * // you can still configure the matcher function to accept windows paths
+ * const isMatch = picomatch('a/*', { options: windows });
+ * console.log(isMatch('a\\b')); //=> true
+ * console.log(isMatch('a/b')); //=> true
  * ```
  * @name picomatch
  * @param {String|Array} `globs` One or more glob patterns.
@@ -12678,9 +12868,9 @@ picomatch.test = (input, regex, options, { glob, posix } = {}) => {
  * @api public
  */
 
-picomatch.matchBase = (input, glob, options) => {
+picomatch.matchBase = (input, glob, options, posix = options && options.windows) => {
   const regex = glob instanceof RegExp ? glob : picomatch.makeRe(glob, options);
-  return regex.test(utils.basename(input));
+  return regex.test(utils.basename(input, { windows: posix }));
 };
 
 /**
@@ -19987,7 +20177,6 @@ function defaultFactory (origin, opts) {
 
 class Agent extends DispatcherBase {
   constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
-
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -20373,6 +20562,9 @@ const EMPTY_BUF = Buffer.alloc(0)
 const FastBuffer = Buffer[Symbol.species]
 const addListener = util.addListener
 const removeAllListeners = util.removeAllListeners
+const kIdleSocketValidation = Symbol('kIdleSocketValidation')
+const kIdleSocketValidationTimeout = Symbol('kIdleSocketValidationTimeout')
+const kSocketUsed = Symbol('kSocketUsed')
 
 let extractBody
 
@@ -20595,27 +20787,69 @@ class Parser {
 
       const offset = llhttp.llhttp_get_error_pos(this.ptr) - currentBufferPtr
 
-      if (ret === constants.ERROR.PAUSED_UPGRADE) {
-        this.onUpgrade(data.slice(offset))
-      } else if (ret === constants.ERROR.PAUSED) {
-        this.paused = true
-        socket.unshift(data.slice(offset))
-      } else if (ret !== constants.ERROR.OK) {
-        const ptr = llhttp.llhttp_get_error_reason(this.ptr)
-        let message = ''
-        /* istanbul ignore else: difficult to make a test case for */
-        if (ptr) {
-          const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
-          message =
-            'Response does not match the HTTP/1.1 protocol (' +
-            Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
-            ')'
+      if (ret !== constants.ERROR.OK) {
+        const body = data.subarray(offset)
+
+        if (ret === constants.ERROR.PAUSED_UPGRADE) {
+          this.onUpgrade(body)
+        } else if (ret === constants.ERROR.PAUSED) {
+          this.paused = true
+          socket.unshift(body)
+        } else {
+          throw this.createError(ret, body)
         }
-        throw new HTTPParserError(message, constants.ERROR[ret], data.slice(offset))
       }
     } catch (err) {
       util.destroy(socket, err)
     }
+  }
+
+  finish () {
+    assert(currentParser === null)
+    assert(this.ptr != null)
+    assert(!this.paused)
+
+    const { llhttp } = this
+
+    let ret
+
+    try {
+      currentParser = this
+      ret = llhttp.llhttp_finish(this.ptr)
+    } finally {
+      currentParser = null
+    }
+
+    if (ret === constants.ERROR.OK) {
+      return null
+    }
+
+    if (ret === constants.ERROR.PAUSED || ret === constants.ERROR.PAUSED_UPGRADE) {
+      this.paused = true
+      return null
+    }
+
+    return this.createError(ret, EMPTY_BUF)
+  }
+
+  createError (ret, data) {
+    const { llhttp, contentLength, bytesRead } = this
+
+    if (contentLength && bytesRead !== parseInt(contentLength, 10)) {
+      return new ResponseContentLengthMismatchError()
+    }
+
+    const ptr = llhttp.llhttp_get_error_reason(this.ptr)
+    let message = ''
+    if (ptr) {
+      const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
+      message =
+        'Response does not match the HTTP/1.1 protocol (' +
+        Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
+        ')'
+    }
+
+    return new HTTPParserError(message, constants.ERROR[ret], data)
   }
 
   destroy () {
@@ -20642,6 +20876,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -20745,6 +20984,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -20921,6 +21165,7 @@ class Parser {
     request.onComplete(headers)
 
     client[kQueue][client[kRunningIdx]++] = null
+    socket[kSocketUsed] = true
 
     if (socket[kWriting]) {
       assert(client[kRunning] === 0)
@@ -20979,6 +21224,9 @@ async function connectH1 (client, socket) {
   socket[kWriting] = false
   socket[kReset] = false
   socket[kBlocking] = false
+  socket[kIdleSocketValidation] = 0
+  socket[kIdleSocketValidationTimeout] = null
+  socket[kSocketUsed] = false
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
@@ -20989,8 +21237,11 @@ async function connectH1 (client, socket) {
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
     // to the user.
     if (err.code === 'ECONNRESET' && parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so for as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        this[kError] = parserErr
+        this[kClient][kOnError](parserErr)
+      }
       return
     }
 
@@ -21009,8 +21260,10 @@ async function connectH1 (client, socket) {
     const parser = this[kParser]
 
     if (parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so far as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        util.destroy(this, parserErr)
+      }
       return
     }
 
@@ -21020,10 +21273,11 @@ async function connectH1 (client, socket) {
     const client = this[kClient]
     const parser = this[kParser]
 
+    clearIdleSocketValidation(this)
+
     if (parser) {
       if (!this[kError] && parser.statusCode && !parser.shouldKeepAlive) {
-        // We treat all incoming data so far as a valid response.
-        parser.onMessageComplete()
+        this[kError] = parser.finish() || this[kError]
       }
 
       this[kParser].destroy()
@@ -21086,7 +21340,7 @@ async function connectH1 (client, socket) {
       return socket.destroyed
     },
     busy (request) {
-      if (socket[kWriting] || socket[kReset] || socket[kBlocking]) {
+      if (socket[kWriting] || socket[kReset] || socket[kBlocking] || socket[kIdleSocketValidation] === 1) {
         return true
       }
 
@@ -21124,6 +21378,31 @@ async function connectH1 (client, socket) {
   }
 }
 
+function clearIdleSocketValidation (socket) {
+  if (socket[kIdleSocketValidationTimeout]) {
+    clearTimeout(socket[kIdleSocketValidationTimeout])
+    socket[kIdleSocketValidationTimeout] = null
+  }
+
+  socket[kIdleSocketValidation] = 0
+}
+
+function scheduleIdleSocketValidation (client, socket) {
+  socket[kIdleSocketValidation] = 1
+  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+    socket[kIdleSocketValidationTimeout] = null
+    socket[kIdleSocketValidation] = 2
+
+    if (client[kSocket] === socket && !socket.destroyed) {
+      client[kResume]()
+    }
+  }, 0)
+  socket[kIdleSocketValidationTimeout].unref?.()
+}
+
+/**
+ * @param {import('./client.js')} client
+ */
 function resumeH1 (client) {
   const socket = client[kSocket]
 
@@ -21136,6 +21415,32 @@ function resumeH1 (client) {
     } else if (socket[kNoRef] && socket.ref) {
       socket.ref()
       socket[kNoRef] = false
+    }
+
+    if (client[kRunning] === 0 && client[kPending] > 0 && socket[kSocketUsed]) {
+      if (socket[kIdleSocketValidation] === 0) {
+        scheduleIdleSocketValidation(client, socket)
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+
+      if (socket[kIdleSocketValidation] === 1) {
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+    }
+
+    if (client[kRunning] === 0) {
+      socket[kParser].readMore()
+      if (socket.destroyed) {
+        return
+      }
     }
 
     if (client[kSize] === 0) {
@@ -21231,6 +21536,7 @@ function writeH1 (client, request) {
   }
 
   const socket = client[kSocket]
+  clearIdleSocketValidation(socket)
 
   const abort = (err) => {
     if (request.aborted || request.completed) {
@@ -23100,6 +23406,7 @@ class DispatcherBase extends Dispatcher {
 
   get webSocketOptions () {
     return {
+      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
     }
   }
@@ -28999,32 +29306,25 @@ function parseUnparsedAttributes (unparsedAttributes, cookieAttributeList = {}) 
     // If the attribute-name case-insensitively matches the string
     // "SameSite", the user agent MUST process the cookie-av as follows:
 
-    // 1. Let enforcement be "Default".
-    let enforcement = 'Default'
-
     const attributeValueLowercase = attributeValue.toLowerCase()
-    // 2. If cookie-av's attribute-value is a case-insensitive match for
-    //    "None", set enforcement to "None".
-    if (attributeValueLowercase.includes('none')) {
-      enforcement = 'None'
-    }
 
-    // 3. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Strict", set enforcement to "Strict".
-    if (attributeValueLowercase.includes('strict')) {
-      enforcement = 'Strict'
+    // 1. If cookie-av's attribute-value is a case-insensitive match for
+    //    "None", append an attribute to the cookie-attribute-list with an
+    //    attribute-name of "SameSite" and an attribute-value of "None".
+    if (attributeValueLowercase === 'none') {
+      cookieAttributeList.sameSite = 'None'
+    } else if (attributeValueLowercase === 'strict') {
+      // 2. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Strict", append an attribute to the cookie-attribute-list with
+      //    an attribute-name of "SameSite" and an attribute-value of
+      //    "Strict".
+      cookieAttributeList.sameSite = 'Strict'
+    } else if (attributeValueLowercase === 'lax') {
+      // 3. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Lax", append an attribute to the cookie-attribute-list with an
+      //    attribute-name of "SameSite" and an attribute-value of "Lax".
+      cookieAttributeList.sameSite = 'Lax'
     }
-
-    // 4. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Lax", set enforcement to "Lax".
-    if (attributeValueLowercase.includes('lax')) {
-      enforcement = 'Lax'
-    }
-
-    // 5. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of "SameSite" and an attribute-value of
-    //    enforcement.
-    cookieAttributeList.sameSite = enforcement
   } else {
     cookieAttributeList.unparsed ??= []
 
@@ -41820,6 +42120,11 @@ const { closeWebSocketConnection } = __nccwpck_require__(6897)
 const { PerMessageDeflate } = __nccwpck_require__(9469)
 const { MessageSizeExceededError } = __nccwpck_require__(8707)
 
+function failWebsocketConnectionWithCode (ws, code, reason) {
+  closeWebSocketConnection(ws, code, reason, Buffer.byteLength(reason))
+  failWebsocketConnection(ws, reason)
+}
+
 // This code was influenced by ws released under the MIT license.
 // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
 // Copyright (c) 2013 Arnout Kazemier and contributors
@@ -41840,18 +42145,22 @@ class ByteParser extends Writable {
   #extensions
 
   /** @type {number} */
+  #maxFragments
+
+  /** @type {number} */
   #maxPayloadSize
 
   /**
    * @param {import('./websocket').WebSocket} ws
    * @param {Map<string, string>|null} extensions
-   * @param {{ maxPayloadSize?: number }} [options]
+   * @param {{ maxFragments?: number, maxPayloadSize?: number }} [options]
    */
   constructor (ws, extensions, options = {}) {
     super()
 
     this.ws = ws
     this.#extensions = extensions == null ? new Map() : extensions
+    this.#maxFragments = options.maxFragments ?? 0
     this.#maxPayloadSize = options.maxPayloadSize ?? 0
 
     if (this.#extensions.has('permessage-deflate')) {
@@ -41875,9 +42184,9 @@ class ByteParser extends Writable {
     if (
       this.#maxPayloadSize > 0 &&
       !isControlFrame(this.#info.opcode) &&
-      this.#info.payloadLength > this.#maxPayloadSize
+      this.#info.payloadLength + this.#fragmentsBytes > this.#maxPayloadSize
     ) {
-      failWebsocketConnection(this.ws, 'Payload size exceeds maximum allowed size')
+      failWebsocketConnectionWithCode(this.ws, 1009, 'Payload size exceeds maximum allowed size')
       return false
     }
 
@@ -42042,10 +42351,12 @@ class ByteParser extends Writable {
           this.#state = parserStates.INFO
         } else {
           if (!this.#info.compressed) {
-            this.writeFragments(body)
+            if (!this.writeFragments(body)) {
+              return
+            }
 
             if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-              failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+              failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
               return
             }
 
@@ -42064,14 +42375,17 @@ class ByteParser extends Writable {
               this.#info.fin,
               (error, data) => {
                 if (error) {
-                  failWebsocketConnection(this.ws, error.message)
+                  const code = error instanceof MessageSizeExceededError ? 1009 : 1007
+                  failWebsocketConnectionWithCode(this.ws, code, error.message)
                   return
                 }
 
-                this.writeFragments(data)
+                if (!this.writeFragments(data)) {
+                  return
+                }
 
                 if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-                  failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+                  failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
                   return
                 }
 
@@ -42141,8 +42455,17 @@ class ByteParser extends Writable {
   }
 
   writeFragments (fragment) {
+    if (
+      this.#maxFragments > 0 &&
+      this.#fragments.length === this.#maxFragments
+    ) {
+      failWebsocketConnectionWithCode(this.ws, 1008, 'Too many message fragments')
+      return false
+    }
+
     this.#fragmentsBytes += fragment.length
     this.#fragments.push(fragment)
+    return true
   }
 
   consumeFragments () {
@@ -43191,9 +43514,12 @@ class WebSocket extends EventTarget {
     // once this happens, the connection is open
     this[kResponse] = response
 
-    const maxPayloadSize = this[kController]?.dispatcher?.webSocketOptions?.maxPayloadSize
+    const webSocketOptions = this[kController]?.dispatcher?.webSocketOptions
+    const maxFragments = webSocketOptions?.maxFragments
+    const maxPayloadSize = webSocketOptions?.maxPayloadSize
 
     const parser = new ByteParser(this, parsedExtensions, {
+      maxFragments,
       maxPayloadSize
     })
     parser.on('drain', onParserDrain)
@@ -48612,180 +48938,180 @@ module.exports = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("zlib");
 
 /***/ }),
 
-/***/ 1120:
-/***/ ((module) => {
+/***/ 4649:
+/***/ ((__unused_webpack_module, exports) => {
 
 var __webpack_unused_export__;
 
-
-const NullObject = function NullObject () { }
-NullObject.prototype = Object.create(null)
-
-/**
- * RegExp to match *( ";" parameter ) in RFC 7231 sec 3.1.1.1
- *
- * parameter     = token "=" ( token / quoted-string )
- * token         = 1*tchar
- * tchar         = "!" / "#" / "$" / "%" / "&" / "'" / "*"
- *               / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
- *               / DIGIT / ALPHA
- *               ; any VCHAR, except delimiters
- * quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE
- * qdtext        = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text
- * obs-text      = %x80-FF
- * quoted-pair   = "\" ( HTAB / SP / VCHAR / obs-text )
+/*!
+ * content-type
+ * Copyright(c) 2015 Douglas Christopher Wilson
+ * MIT Licensed
  */
-const paramRE = /; *([!#$%&'*+.^\w`|~-]+)=("(?:[\v\u0020\u0021\u0023-\u005b\u005d-\u007e\u0080-\u00ff]|\\[\v\u0020-\u00ff])*"|[!#$%&'*+.^\w`|~-]+) */gu
-
+__webpack_unused_export__ = ({ value: true });
+__webpack_unused_export__ = format;
+exports.qg = parse;
+const TEXT_REGEXP = /^[\u0009\u0020-\u007e\u0080-\u00ff]*$/;
+const TOKEN_REGEXP = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 /**
- * RegExp to match quoted-pair in RFC 7230 sec 3.2.6
- *
- * quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )
- * obs-text    = %x80-FF
+ * RegExp to match chars that must be quoted-pair in RFC 9110 sec 5.6.4
  */
-const quotedPairRE = /\\([\v\u0020-\u00ff])/gu
-
+const QUOTE_REGEXP = /[\\"]/g;
 /**
- * RegExp to match type in RFC 7231 sec 3.1.1.1
+ * RegExp to match type in RFC 9110 sec 8.3.1
  *
  * media-type = type "/" subtype
  * type       = token
  * subtype    = token
  */
-const mediaTypeRE = /^[!#$%&'*+.^\w|~-]+\/[!#$%&'*+.^\w|~-]+$/u
-
-// default ContentType to prevent repeated object creation
-const defaultContentType = { type: '', parameters: new NullObject() }
-Object.freeze(defaultContentType.parameters)
-Object.freeze(defaultContentType)
-
+const TYPE_REGEXP = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 /**
- * Parse media type to object.
- *
- * @param {string|object} header
- * @return {Object}
- * @public
+ * Null object perf optimization. Faster than `Object.create(null)` and `{ __proto__: null }`.
  */
-
-function parse (header) {
-  if (typeof header !== 'string') {
-    throw new TypeError('argument header is required and must be a string')
-  }
-
-  let index = header.indexOf(';')
-  const type = index !== -1
-    ? header.slice(0, index).trim()
-    : header.trim()
-
-  if (mediaTypeRE.test(type) === false) {
-    throw new TypeError('invalid media type')
-  }
-
-  const result = {
-    type: type.toLowerCase(),
-    parameters: new NullObject()
-  }
-
-  // parse parameters
-  if (index === -1) {
-    return result
-  }
-
-  let key
-  let match
-  let value
-
-  paramRE.lastIndex = index
-
-  while ((match = paramRE.exec(header))) {
-    if (match.index !== index) {
-      throw new TypeError('invalid parameter format')
+const NullObject = /* @__PURE__ */ (() => {
+    const C = function () { };
+    C.prototype = Object.create(null);
+    return C;
+})();
+/**
+ * Format an object into a `Content-Type` header.
+ */
+function format(obj) {
+    const { type, parameters } = obj;
+    if (!type || !TYPE_REGEXP.test(type)) {
+        throw new TypeError(`Invalid type: ${type}`);
     }
-
-    index += match[0].length
-    key = match[1].toLowerCase()
-    value = match[2]
-
-    if (value[0] === '"') {
-      // remove quotes and escapes
-      value = value
-        .slice(1, value.length - 1)
-
-      quotedPairRE.test(value) && (value = value.replace(quotedPairRE, '$1'))
+    let result = type;
+    if (parameters) {
+        for (const param of Object.keys(parameters)) {
+            if (!TOKEN_REGEXP.test(param)) {
+                throw new TypeError(`Invalid parameter name: ${param}`);
+            }
+            result += `; ${param}=${qstring(parameters[param])}`;
+        }
     }
-
-    result.parameters[key] = value
-  }
-
-  if (index !== header.length) {
-    throw new TypeError('invalid parameter format')
-  }
-
-  return result
+    return result;
 }
-
-function safeParse (header) {
-  if (typeof header !== 'string') {
-    return defaultContentType
-  }
-
-  let index = header.indexOf(';')
-  const type = index !== -1
-    ? header.slice(0, index).trim()
-    : header.trim()
-
-  if (mediaTypeRE.test(type) === false) {
-    return defaultContentType
-  }
-
-  const result = {
-    type: type.toLowerCase(),
-    parameters: new NullObject()
-  }
-
-  // parse parameters
-  if (index === -1) {
-    return result
-  }
-
-  let key
-  let match
-  let value
-
-  paramRE.lastIndex = index
-
-  while ((match = paramRE.exec(header))) {
-    if (match.index !== index) {
-      return defaultContentType
-    }
-
-    index += match[0].length
-    key = match[1].toLowerCase()
-    value = match[2]
-
-    if (value[0] === '"') {
-      // remove quotes and escapes
-      value = value
-        .slice(1, value.length - 1)
-
-      quotedPairRE.test(value) && (value = value.replace(quotedPairRE, '$1'))
-    }
-
-    result.parameters[key] = value
-  }
-
-  if (index !== header.length) {
-    return defaultContentType
-  }
-
-  return result
+/**
+ * Parse a `Content-Type` header.
+ */
+function parse(header, options) {
+    const len = header.length;
+    let index = skipOWS(header, 0, len);
+    const valueStart = index;
+    index = skipValue(header, index, len);
+    const valueEnd = trailingOWS(header, valueStart, index);
+    const type = header.slice(valueStart, valueEnd).toLowerCase();
+    const parameters = options?.parameters === false
+        ? new NullObject()
+        : parseParameters(header, index, len);
+    return { type, parameters };
 }
-
-__webpack_unused_export__ = { parse, safeParse }
-__webpack_unused_export__ = parse
-module.exports.xL = safeParse
-__webpack_unused_export__ = defaultContentType
-
+const SP = 32; // " "
+const HTAB = 9; // "\t"
+const SEMI = 59; // ";"
+const EQ = 61; // "="
+const DQUOTE = 34; // '"'
+const BSLASH = 92; // "\\"
+/**
+ * Parses the parameters of a `Content-Type` header starting at the given index.
+ */
+function parseParameters(header, index, len) {
+    const parameters = new NullObject();
+    parameter: while (index < len) {
+        index = skipOWS(header, index + 1 /* Skip over ; */, len);
+        const keyStart = index;
+        while (index < len) {
+            const code = header.charCodeAt(index);
+            if (code === SEMI)
+                continue parameter;
+            if (code === EQ) {
+                const keyEnd = trailingOWS(header, keyStart, index);
+                const key = header.slice(keyStart, keyEnd).toLowerCase();
+                index = skipOWS(header, index + 1, len);
+                if (index < len && header.charCodeAt(index) === DQUOTE) {
+                    index++;
+                    let value = "";
+                    while (index < len) {
+                        const code = header.charCodeAt(index++);
+                        if (code === DQUOTE) {
+                            index = skipValue(header, index, len);
+                            if (parameters[key] === undefined)
+                                parameters[key] = value;
+                            break;
+                        }
+                        if (code === BSLASH && index < len) {
+                            value += header[index++];
+                            continue;
+                        }
+                        value += String.fromCharCode(code);
+                    }
+                    continue parameter;
+                }
+                const valueStart = index;
+                index = skipValue(header, index, len);
+                if (parameters[key] === undefined) {
+                    const valueEnd = trailingOWS(header, valueStart, index);
+                    parameters[key] = header.slice(valueStart, valueEnd);
+                }
+                continue parameter;
+            }
+            index++;
+        }
+    }
+    return parameters;
+}
+/**
+ * Skip over characters until a semicolon.
+ */
+function skipValue(str, index, len) {
+    while (index < len) {
+        const char = str.charCodeAt(index);
+        if (char === SEMI)
+            break;
+        index++;
+    }
+    return index;
+}
+/**
+ * Skip optional whitespace (OWS) in an HTTP header value.
+ *
+ * OWS is defined in RFC 9110 sec 5.6.3 as SP (" ") or HTAB ("\t").
+ */
+function skipOWS(header, index, len) {
+    while (index < len) {
+        const char = header.charCodeAt(index);
+        if (char !== SP && char !== HTAB)
+            break;
+        index++;
+    }
+    return index;
+}
+/**
+ * Trim optional whitespace (OWS) from the end of a substring.
+ *
+ * OWS is defined in RFC 9110 sec 5.6.3 as SP (" ") or HTAB ("\t").
+ */
+function trailingOWS(header, start, end) {
+    while (end > start) {
+        const char = header.charCodeAt(end - 1);
+        if (char !== SP && char !== HTAB)
+            break;
+        end--;
+    }
+    return end;
+}
+/**
+ * Serialize a parameter value.
+ */
+function qstring(str) {
+    if (TOKEN_REGEXP.test(str))
+        return str;
+    if (TEXT_REGEXP.test(str))
+        return `"${str.replace(QUOTE_REGEXP, "\\$&")}"`;
+    throw new TypeError(`Invalid parameter value: ${str}`);
+}
+//# sourceMappingURL=index.js.map
 
 /***/ }),
 
@@ -52741,8 +53067,8 @@ function withDefaults(oldDefaults, newDefaults) {
 var endpoint = withDefaults(null, DEFAULTS);
 
 
-// EXTERNAL MODULE: ./node_modules/fast-content-type-parse/index.js
-var fast_content_type_parse = __nccwpck_require__(1120);
+// EXTERNAL MODULE: ./node_modules/content-type/dist/index.js
+var dist = __nccwpck_require__(4649);
 ;// CONCATENATED MODULE: ./node_modules/json-with-bigint/json-with-bigint.js
 const intRegex = /^-?\d+$/;
 const noiseValue = /^-?\d+n+$/; // Noise - strings that match the custom format before being converted to it
@@ -52750,14 +53076,269 @@ const originalStringify = JSON.stringify;
 const originalParse = JSON.parse;
 const customFormat = /^-?\d+n$/;
 
-const bigIntsStringify = /([\[:])?"(-?\d+)n"($|([\\n]|\s)*(\s|[\\n])*[,\}\]])/g;
-const noiseStringify =
-  /([\[:])?("-?\d+n+)n("$|"([\\n]|\s)*(\s|[\\n])*[,\}\]])/g;
+const bigIntsStringify = /([\[:])?"(-?\d+)n"($|\s*[,\}\]])/g;
+const noiseStringify = /([\[:])?("-?\d+n+)n("$|"\s*[,\}\]])/g;
 
 /**
  * @typedef {(this: any, key: string | number | undefined, value: any) => any} Replacer
  * @typedef {(key: string | number | undefined, value: any, context?: { source: string }) => any} Reviver
  */
+
+/**
+ * Checks if a value is unstringifiable according to native JSON.stringify rules.
+ *
+ * @param {any} val The value to check.
+ * @returns {boolean} True if the value is undefined, a function, or a symbol.
+ */
+const isUnstringifiable = (val) =>
+  val === undefined || typeof val === "function" || typeof val === "symbol";
+
+/**
+ * Checks if a value is a native JSON.rawJSON object (Node.js 22+).
+ *
+ * @param {any} val The value to check.
+ * @returns {boolean} True if the value is a RawJSON instance.
+ */
+const isRawJSON = (val) =>
+  val !== null &&
+  typeof val === "object" &&
+  val.constructor &&
+  val.constructor.name === "RawJSON";
+
+/**
+ * Iteratively converts a JS value to a JSON string.
+ * Used as a fallback when the native JSON.stringify hits the Maximum Call Stack size.
+ * Fully compliant with JSON formatting (space), replacers, and toJSON behaviors.
+ *
+ * @param {any} rootValue The value to stringify.
+ * @param {Replacer | Array<string | number> | null} [replacer] User's custom replacer function.
+ * @param {string | number} [spaceParam] Indentation for pretty-printing.
+ * @returns {string | undefined} The generated JSON string.
+ */
+const stringifyIteratively = (rootValue, replacer, spaceParam) => {
+  let space = "";
+
+  if (typeof spaceParam === "number") {
+    space = " ".repeat(Math.min(10, Math.max(0, Math.floor(spaceParam))));
+  } else if (typeof spaceParam === "string") {
+    space = spaceParam.slice(0, 10);
+  }
+
+  const isFunctionReplacer = typeof replacer === "function";
+  const propertyList = Array.isArray(replacer)
+    ? new Set(replacer.map(String))
+    : null;
+
+  /**
+   * Prepares a value for stringification by resolving toJSON, handling BigInts,
+   * applying custom replacers, and unwrapping primitive objects.
+   *
+   * @param {object|Array} parent The parent object or array holding the value.
+   * @param {string} key The key associated with the value.
+   * @param {any} val The raw value to process.
+   * @returns {any} The processed value ready for stringification.
+   */
+  const prepareVal = (parent, key, val) => {
+    const isObject = val !== null && typeof val === "object";
+    const hasToJSON = isObject && typeof val.toJSON === "function";
+
+    if (hasToJSON) {
+      val = val.toJSON(key);
+    }
+
+    const isNoise = typeof val === "string" && noiseValue.test(val);
+
+    if (isNoise) return val + "n";
+
+    const isBigInt = typeof val === "bigint";
+
+    if (isBigInt) {
+      const supportsRawJSON = "rawJSON" in JSON;
+
+      if (supportsRawJSON) return JSON.rawJSON(val.toString());
+
+      return val.toString() + "n";
+    }
+
+    if (isFunctionReplacer) {
+      val = replacer.call(parent, key, val);
+    }
+
+    const isPostReplacerObject = val !== null && typeof val === "object";
+
+    if (isPostReplacerObject) {
+      const isPrimitiveWrapper =
+        val instanceof Number ||
+        val instanceof String ||
+        val instanceof Boolean;
+
+      if (isPrimitiveWrapper) {
+        val = val.valueOf();
+      }
+    }
+
+    return val;
+  };
+
+  const rootProcessed = prepareVal({ "": rootValue }, "", rootValue);
+
+  if (isUnstringifiable(rootProcessed)) {
+    return undefined;
+  }
+
+  const isRootPrimitive =
+    rootProcessed === null || typeof rootProcessed !== "object";
+  const isRootNativeRawJSON = isRawJSON(rootProcessed);
+
+  if (isRootPrimitive || isRootNativeRawJSON) {
+    return originalStringify(rootProcessed);
+  }
+
+  const chunks = [];
+  let level = 0;
+
+  const stack = [
+    {
+      parent: { "": rootProcessed },
+      key: "",
+      val: rootProcessed,
+      isArray: Array.isArray(rootProcessed),
+      keys: Array.isArray(rootProcessed) ? null : Object.keys(rootProcessed),
+      index: 0,
+      first: true,
+    },
+  ];
+
+  const visited = new WeakSet([rootProcessed]);
+
+  while (stack.length > 0) {
+    const node = stack[stack.length - 1];
+
+    if (node.index === 0) {
+      chunks.push(node.isArray ? "[" : "{");
+      level++;
+    }
+
+    let isDone = false;
+
+    if (node.isArray) {
+      if (node.index < node.val.length) {
+        if (!node.first) chunks.push(",");
+
+        if (space) chunks.push("\n" + space.repeat(level));
+
+        const childRaw = node.val[node.index];
+        const childVal = prepareVal(node.val, String(node.index), childRaw);
+
+        if (isUnstringifiable(childVal)) {
+          chunks.push("null");
+          node.first = false;
+          node.index++;
+        } else {
+          const isComplexObject =
+            childVal !== null && typeof childVal === "object";
+          const isNativeRaw = isRawJSON(childVal);
+
+          if (isComplexObject && !isNativeRaw) {
+            if (visited.has(childVal)) {
+              throw new TypeError("Converting circular structure to JSON");
+            }
+
+            visited.add(childVal);
+
+            stack.push({
+              parent: node.val,
+              key: String(node.index),
+              val: childVal,
+              isArray: Array.isArray(childVal),
+              keys: Array.isArray(childVal) ? null : Object.keys(childVal),
+              index: 0,
+              first: true,
+            });
+
+            node.first = false;
+            node.index++;
+          } else {
+            chunks.push(originalStringify(childVal));
+            node.first = false;
+            node.index++;
+          }
+        }
+      } else {
+        isDone = true;
+      }
+    } else {
+      while (node.index < node.keys.length) {
+        const k = node.keys[node.index++];
+
+        const isFilteredOutByArray = propertyList && !propertyList.has(k);
+
+        if (isFilteredOutByArray) continue;
+
+        const childRaw = node.val[k];
+        const childVal = prepareVal(node.val, k, childRaw);
+
+        if (isUnstringifiable(childVal)) continue;
+
+        if (!node.first) chunks.push(",");
+
+        if (space) {
+          chunks.push("\n" + space.repeat(level) + originalStringify(k) + ": ");
+        } else {
+          chunks.push(originalStringify(k) + ":");
+        }
+
+        const isComplexObject =
+          childVal !== null && typeof childVal === "object";
+        const isNativeRaw = isRawJSON(childVal);
+
+        if (isComplexObject && !isNativeRaw) {
+          if (visited.has(childVal)) {
+            throw new TypeError("Converting circular structure to JSON");
+          }
+
+          visited.add(childVal);
+
+          stack.push({
+            parent: node.val,
+            key: k,
+            val: childVal,
+            isArray: Array.isArray(childVal),
+            keys: Array.isArray(childVal) ? null : Object.keys(childVal),
+            index: 0,
+            first: true,
+          });
+
+          node.first = false;
+
+          break; // Stop current loop level to process the newly pushed stack node
+        } else {
+          chunks.push(originalStringify(childVal));
+          node.first = false;
+        }
+      }
+
+      const isNodeFullyProcessed =
+        node.index >= node.keys.length && stack[stack.length - 1] === node;
+
+      if (isNodeFullyProcessed) {
+        isDone = true;
+      }
+    }
+
+    if (isDone) {
+      level--;
+
+      if (!node.first && space) chunks.push("\n" + space.repeat(level));
+
+      chunks.push(node.isArray ? "]" : "}");
+      visited.delete(node.val);
+      stack.pop();
+    }
+  }
+
+  return chunks.join("");
+};
 
 /**
  * Converts a JavaScript value to a JSON string.
@@ -52770,55 +53351,87 @@ const noiseStringify =
  *
  * @param {*} value The value to convert to a JSON string.
  * @param {Replacer | Array<string | number> | null} [replacer]
- *   A function that alters the behavior of the stringification process,
- *   or an array of strings/numbers to indicate properties to exclude.
+ * A function that alters the behavior of the stringification process,
+ * or an array of strings/numbers to indicate properties to exclude.
  * @param {string | number} [space]
- *   A string or number to specify indentation or pretty-printing.
+ * A string or number to specify indentation or pretty-printing.
  * @returns {string} The JSON string representation.
  */
 const JSONStringify = (value, replacer, space) => {
-  if ("rawJSON" in JSON) {
-    return originalStringify(
+  try {
+    const supportsRawJSON = "rawJSON" in JSON;
+
+    if (supportsRawJSON) {
+      return originalStringify(
+        value,
+        (key, val) => {
+          if (typeof val === "bigint") return JSON.rawJSON(val.toString());
+
+          const hasFunctionReplacer = typeof replacer === "function";
+
+          if (hasFunctionReplacer) return replacer(key, val);
+
+          const isKeyInArrayReplacer =
+            Array.isArray(replacer) && replacer.includes(key);
+
+          if (isKeyInArrayReplacer) return val;
+
+          return val;
+        },
+        space,
+      );
+    }
+
+    if (!value) return originalStringify(value, replacer, space);
+
+    const convertedToCustomJSON = originalStringify(
       value,
-      (key, value) => {
-        if (typeof value === "bigint") return JSON.rawJSON(value.toString());
+      (key, val) => {
+        const isNoise = typeof val === "string" && noiseValue.test(val);
 
-        if (typeof replacer === "function") return replacer(key, value);
+        if (isNoise) return val.toString() + "n"; // Mark noise values with additional "n" to offset the deletion of one "n" during the processing
 
-        if (Array.isArray(replacer) && replacer.includes(key)) return value;
+        if (typeof val === "bigint") return val.toString() + "n";
 
-        return value;
+        const hasFunctionReplacer = typeof replacer === "function";
+
+        if (hasFunctionReplacer) return replacer(key, val);
+
+        const isKeyInArrayReplacer =
+          Array.isArray(replacer) && replacer.includes(key);
+
+        if (isKeyInArrayReplacer) return val;
+
+        return val;
       },
       space,
     );
+
+    const processedJSON = convertedToCustomJSON.replace(
+      bigIntsStringify,
+      "$1$2$3",
+    ); // Delete one "n" off the end of every BigInt value
+
+    const denoisedJSON = processedJSON.replace(noiseStringify, "$1$2$3"); // Remove one "n" off the end of every noisy string
+
+    return denoisedJSON;
+  } catch (error) {
+    if (error instanceof RangeError) {
+      const convertedJSON = stringifyIteratively(value, replacer, space);
+
+      if (convertedJSON === undefined) return undefined;
+
+      const supportsRawJSON = "rawJSON" in JSON;
+
+      if (supportsRawJSON) return convertedJSON;
+
+      const processedJSON = convertedJSON.replace(bigIntsStringify, "$1$2$3");
+
+      return processedJSON.replace(noiseStringify, "$1$2$3");
+    }
+
+    throw error;
   }
-
-  if (!value) return originalStringify(value, replacer, space);
-
-  const convertedToCustomJSON = originalStringify(
-    value,
-    (key, value) => {
-      const isNoise = typeof value === "string" && noiseValue.test(value);
-
-      if (isNoise) return value.toString() + "n"; // Mark noise values with additional "n" to offset the deletion of one "n" during the processing
-
-      if (typeof value === "bigint") return value.toString() + "n";
-
-      if (typeof replacer === "function") return replacer(key, value);
-
-      if (Array.isArray(replacer) && replacer.includes(key)) return value;
-
-      return value;
-    },
-    space,
-  );
-  const processedJSON = convertedToCustomJSON.replace(
-    bigIntsStringify,
-    "$1$2$3",
-  ); // Delete one "n" off the end of every BigInt value
-  const denoisedJSON = processedJSON.replace(noiseStringify, "$1$2$3"); // Remove one "n" off the end of every noisy string
-
-  return denoisedJSON;
 };
 
 const featureCache = new Map();
@@ -52866,12 +53479,15 @@ const isContextSourceSupported = () => {
 const convertMarkedBigIntsReviver = (key, value, context, userReviver) => {
   const isCustomFormatBigInt =
     typeof value === "string" && customFormat.test(value);
+
   if (isCustomFormatBigInt) return BigInt(value.slice(0, -1));
 
   const isNoiseValue = typeof value === "string" && noiseValue.test(value);
   if (isNoiseValue) return value.slice(0, -1);
 
-  if (typeof userReviver !== "function") return value;
+  const hasUserReviver = typeof userReviver === "function";
+
+  if (!hasUserReviver) return value;
 
   return userReviver(key, value, context);
 };
@@ -52889,15 +53505,18 @@ const convertMarkedBigIntsReviver = (key, value, context, userReviver) => {
  */
 const JSONParseV2 = (text, reviver) => {
   return JSON.parse(text, (key, value, context) => {
-    const isBigNumber =
-      typeof value === "number" &&
-      (value > Number.MAX_SAFE_INTEGER || value < Number.MIN_SAFE_INTEGER);
+    const isNumber = typeof value === "number";
+    const isOutOfBounds =
+      value > Number.MAX_SAFE_INTEGER || value < Number.MIN_SAFE_INTEGER;
+    const isBigNumber = isNumber && isOutOfBounds;
     const isInt = context && intRegex.test(context.source);
     const isBigInt = isBigNumber && isInt;
 
     if (isBigInt) return BigInt(context.source);
 
-    if (typeof reviver !== "function") return value;
+    const hasCustomReviver = typeof reviver === "function";
+
+    if (!hasCustomReviver) return value;
 
     return reviver(key, value, context);
   });
@@ -52910,6 +53529,105 @@ const stringsOrLargeNumbers =
 const noiseValueWithQuotes = /^"-?\d+n+"$/; // Noise - strings that match the custom format before being converted to it
 
 /**
+ * Iteratively traverses the parsed object bottom-up (post-order),
+ * emulating the native JSON.parse reviver behavior.
+ * This avoids Call Stack overflows (RangeError) on deeply nested structures.
+ *
+ * @param {any} parsed The natively parsed JSON object.
+ * @param {Reviver} [userReviver] User's custom reviver function.
+ * @returns {any} The fully processed object.
+ */
+const applyReviverIteratively = (parsed, userReviver) => {
+  const rootHolder = { "": parsed };
+  const stack = [{ parent: rootHolder, key: "", visited: false }];
+
+  while (stack.length > 0) {
+    const node = stack[stack.length - 1];
+
+    if (!node.visited) {
+      node.visited = true;
+
+      const value = node.parent[node.key];
+      const isComplexObject = value !== null && typeof value === "object";
+
+      if (isComplexObject) {
+        const keys = Object.keys(value);
+
+        for (let i = keys.length - 1; i >= 0; i--) {
+          stack.push({ parent: value, key: keys[i], visited: false });
+        }
+      }
+    } else {
+      const { parent, key } = node;
+      let value = parent[key];
+
+      if (typeof value === "string") {
+        const isCustomFormatBigInt = customFormat.test(value);
+
+        if (isCustomFormatBigInt) {
+          value = BigInt(value.slice(0, -1));
+        } else {
+          const isNoise = noiseValue.test(value);
+
+          if (isNoise) value = value.slice(0, -1);
+        }
+      }
+
+      const hasUserReviver = typeof userReviver === "function";
+
+      if (hasUserReviver) {
+        value = userReviver.call(parent, key, value);
+      }
+
+      const isDeleted = value === undefined;
+
+      if (isDeleted) {
+        delete parent[key];
+      } else {
+        parent[key] = value;
+      }
+
+      stack.pop();
+    }
+  }
+
+  return rootHolder[""];
+};
+
+/**
+ * Pre-processes the JSON string to mark large numbers with an 'n' suffix.
+ *
+ * @param {string} text The raw JSON string.
+ * @returns {string} The serialized string with marked BigInts.
+ */
+const serializeBigInts = (text) => {
+  return text.replace(
+    stringsOrLargeNumbers,
+    (match, digits, fractional, exponential) => {
+      const isString = match[0] === '"';
+      const isNoise = isString && noiseValueWithQuotes.test(match);
+
+      if (isNoise) return match.substring(0, match.length - 1) + 'n"'; // Mark noise values with additional "n" to offset the deletion of one "n" during the processing
+
+      const hasFractionalOrExponential = fractional || exponential;
+
+      // With a fixed number of digits, we can correctly use lexicographical comparison to do a numeric comparison
+      const isLessThanMaxSafeInt =
+        digits &&
+        (digits.length < MAX_DIGITS ||
+          (digits.length === MAX_DIGITS && digits <= MAX_INT));
+
+      const isStandardValue =
+        isString || hasFractionalOrExponential || isLessThanMaxSafeInt;
+
+      if (isStandardValue) return match;
+
+      return '"' + match + 'n"';
+    },
+  );
+};
+
+/**
  * Converts a JSON string into a JavaScript value.
  *
  * Supports parsing of large integers using two strategies:
@@ -52920,42 +53638,34 @@ const noiseValueWithQuotes = /^"-?\d+n+"$/; // Noise - strings that match the cu
  *
  * @param {string} text A valid JSON string.
  * @param {Reviver} [reviver]
- *   A function that transforms the results. This function is called for each member
- *   of the object. If a member contains nested objects, the nested objects are
- *   transformed before the parent object is.
+ * A function that transforms the results. This function is called for each member
+ * of the object. If a member contains nested objects, the nested objects are
+ * transformed before the parent object is.
  * @returns {any} The parsed JavaScript value.
  * @throws {SyntaxError} If text is not valid JSON.
  */
 const JSONParse = (text, reviver) => {
   if (!text) return originalParse(text, reviver);
 
-  if (isContextSourceSupported()) return JSONParseV2(text, reviver); // Shortcut to a faster (2x) and simpler version
+  try {
+    if (isContextSourceSupported()) return JSONParseV2(text, reviver); // Shortcut to a faster (2x) and simpler version
 
-  // Find and mark big numbers with "n"
-  const serializedData = text.replace(
-    stringsOrLargeNumbers,
-    (text, digits, fractional, exponential) => {
-      const isString = text[0] === '"';
-      const isNoise = isString && noiseValueWithQuotes.test(text);
+    // Find and mark big numbers with "n"
+    const serializedData = serializeBigInts(text);
 
-      if (isNoise) return text.substring(0, text.length - 1) + 'n"'; // Mark noise values with additional "n" to offset the deletion of one "n" during the processing
+    return originalParse(serializedData, (key, value, context) =>
+      convertMarkedBigIntsReviver(key, value, context, reviver),
+    );
+  } catch (error) {
+    if (error instanceof RangeError) {
+      const serializedData = serializeBigInts(text);
+      const parsed = originalParse(serializedData);
 
-      const isFractionalOrExponential = fractional || exponential;
-      const isLessThanMaxSafeInt =
-        digits &&
-        (digits.length < MAX_DIGITS ||
-          (digits.length === MAX_DIGITS && digits <= MAX_INT)); // With a fixed number of digits, we can correctly use lexicographical comparison to do a numeric comparison
+      return applyReviverIteratively(parsed, reviver);
+    }
 
-      if (isString || isFractionalOrExponential || isLessThanMaxSafeInt)
-        return text;
-
-      return '"' + text + 'n"';
-    },
-  );
-
-  return originalParse(serializedData, (key, value, context) =>
-    convertMarkedBigIntsReviver(key, value, context, reviver),
-  );
+    throw error;
+  }
 };
 
 
@@ -53009,7 +53719,7 @@ class RequestError extends Error {
 
 
 // pkg/dist-src/version.js
-var dist_bundle_VERSION = "10.0.8";
+var dist_bundle_VERSION = "10.0.11";
 
 // pkg/dist-src/defaults.js
 var defaults_default = {
@@ -53138,7 +53848,7 @@ async function getResponseData(response) {
   if (!contentType) {
     return response.text().catch(noop);
   }
-  const mimetype = (0,fast_content_type_parse/* safeParse */.xL)(contentType);
+  const mimetype = (0,dist/* parse */.qg)(contentType);
   if (isJSONResponse(mimetype)) {
     let text = "";
     try {
@@ -53166,9 +53876,10 @@ function toErrorMessage(data) {
   if (data instanceof ArrayBuffer) {
     return "Unknown error";
   }
-  if ("message" in data) {
-    const suffix = "documentation_url" in data ? ` - ${data.documentation_url}` : "";
-    return Array.isArray(data.errors) ? `${data.message}: ${data.errors.map((v) => JSON.stringify(v)).join(", ")}${suffix}` : `${data.message}${suffix}`;
+  if (typeof data === "object" && data !== null && "message" in data) {
+    const objectData = data;
+    const suffix = "documentation_url" in objectData ? ` - ${objectData.documentation_url}` : "";
+    return Array.isArray(objectData.errors) ? `${objectData.message}: ${objectData.errors.map((v) => JSON.stringify(v)).join(", ")}${suffix}` : `${objectData.message}${suffix}`;
   }
   return `Unknown error: ${JSON.stringify(data)}`;
 }
