@@ -1,8 +1,26 @@
 # Changelog
 
+## 3.2.0
+
+### Fixes
+* Fix: `dotnet-trx` reports unmapped test outcomes and aborted test runs as failures https://github.com/dorny/test-reporter/pull/825
+* Fix: report test cases from nested <testsuite> elements in `java-junit` reporter https://github.com/dorny/test-reporter/pull/840
+
 ## 3.1.0
-* Feature: Add `list-files` input to control test report file listing https://github.com/dorny/test-reporter/pull/773
-* Feature: Add `summary_file` output with the path to the generated summary in Markdown format https://github.com/dorny/test-reporter/pull/772
+
+### Features
+* Add `list-files` input to control test report file listing https://github.com/dorny/test-reporter/pull/773
+* Add `summary_file` output with the path to the generated summary in Markdown format https://github.com/dorny/test-reporter/pull/772
+* Add Unreal Engine JSON reporter support.
+
+### Fixes
+* Preserve PHPUnit exception types when the failure body does not contain a typed line.
+* Parse Jest JUnit failures that provide failure attributes without a failure body.
+* Escape pipe characters in Markdown table cells.
+* Decode report files before parsing and handle byte-order marks correctly.
+
+### Maintenance and security
+* Update dependencies and rebuild the distribution to include security fixes and current tooling.
 
 ## 3.0.0
 * Feature: Use NodeJS 24 LTS as default runtime https://github.com/dorny/test-reporter/pull/738
