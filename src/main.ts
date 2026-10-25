@@ -28,6 +28,7 @@ import {SwiftXunitParser} from './parsers/swift-xunit/swift-xunit-parser.js'
 import {NetteTesterJunitParser} from './parsers/tester-junit/tester-junit-parser.js'
 import {normalizeDirPath, normalizeFilePath} from './utils/path-utils.js'
 import {getCheckRunContext} from './utils/github-utils.js'
+import {UnrealJsonParser} from './parsers/unreal-engine/unreal-json-parser.js'
 
 async function main(): Promise<void> {
   try {
@@ -54,7 +55,7 @@ class TestReporter {
   readonly workDirInput = core.getInput('working-directory', {required: false})
   readonly onlySummary = core.getInput('only-summary', {required: false}) === 'true'
   readonly useActionsSummary = core.getInput('use-actions-summary', {required: false}) === 'true'
-  readonly slugPrefix = `tr-${randomBytes(4).toString('base64url')}-`
+  readonly slugPrefix = `tr-${randomBytes(4).toString('hex')}-`
   readonly badgeTitle = core.getInput('badge-title', {required: false})
   readonly reportTitle = core.getInput('report-title', {required: false})
   readonly collapsed = core.getInput('collapsed', {required: false}) as 'auto' | 'always' | 'never'
@@ -208,6 +209,7 @@ class TestReporter {
       const summary = getReport(
         results,
         {
+          name,
           listSuites,
           listTests,
           slugPrefix,
@@ -242,6 +244,7 @@ class TestReporter {
       core.info('Creating report summary')
       baseUrl = createResp.data.html_url as string
       const summary = getReport(results, {
+        name,
         listSuites,
         listTests,
         slugPrefix,
@@ -319,6 +322,8 @@ class TestReporter {
         return new SwiftXunitParser(options)
       case 'tester-junit':
         return new NetteTesterJunitParser(options)
+      case 'unreal-json':
+        return new UnrealJsonParser(options)
       default:
         throw new Error(`Input variable 'reporter' is set to invalid value '${reporter}'`)
     }
